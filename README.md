@@ -4,6 +4,14 @@ A custom node for ComfyUI that allows you to interact with OpenRouter's API, pro
 
 ## Updates
 
+### 7/11/2026 - Live Model Catalog Refresh
+
+- Uses OpenRouter's dedicated catalogs for chat, image, and video models
+- Refreshes the model dropdown when a node is created and every 15 minutes while it is open
+- Adds a **Refresh Models** button for an immediate refresh without restarting ComfyUI
+- Keeps the last successful catalog in memory if OpenRouter is temporarily unavailable
+- Includes the upstream `reasoning_effort`, request timeout, `LLM_KEY`, and `openrouter_api_key.json` improvements
+
 ### 4/5/2026 - Seed, Resolution, Aspect Ratio, Temperature Fix
 - Added **seed** input
 - Added **image_resolution** dropdown (1K, 2K, 4K)
@@ -25,9 +33,11 @@ Added a new Chat Mode feature that lets you store context to enable conversation
 
 ## Features
 
-- Access to all models available on OpenRouter
+- Access to chat-capable OpenRouter models, including image-capable models exposed through the full models catalog
+- Automatic model synchronization from `/api/v1/models`, `/api/v1/images/models`, and `/api/v1/videos/models`
 - Support for multiple image inputs (up to 10 images) 
 - **NEW: Image generation support** - Generate images with models like google/gemini-2.5-flash-image-preview (Nano-Banana)
+- `image_generation_only` toggle in the main node to filter the model list down to image generation models
 - Dynamic image input visibility - additional inputs appear as you connect images
 - PDF support with multiple OCR engine options
 - Web search capability with `:online` modifier
@@ -36,6 +46,9 @@ Added a new Chat Mode feature that lets you store context to enable conversation
 - Detailed statistics on token usage and generation speed
 - Real-time OpenRouter account balance display
 - **Chat Mode** - Maintain conversation context across multiple messages with automatic session management
+- **OpenRouter Video execution node** - Ready for real async video generation with direct OpenRouter `/api/v1/videos` execution
+- **Video controls driven by the OpenRouter catalog** - mode, duration, resolution, and aspect ratio now follow the selected video model's published capabilities
+- **Estimated video cost** - the video node includes a local cost estimate directly in the node UI, plus status/metadata details based on OpenRouter's public `pricing_skus`
 
 ## Installation
 
@@ -56,6 +69,10 @@ pip install -r requirements.txt
 
 The OpenRouter node provides a simple interface to interact with various LLMs through the OpenRouter API.
 
+### API Key Security
+
+The node's **Set API Key** button stores the key locally and prevents it from being serialized into workflow metadata. For compatibility with the original node, you can alternatively use `OPENROUTER_API_KEY`, `LLM_KEY`, or an ignored `openrouter_api_key.json` file based on `openrouter_api_key.json.example`.
+
 ### Inputs
 
 #### Required Inputs:
@@ -64,11 +81,16 @@ The OpenRouter node provides a simple interface to interact with various LLMs th
 - **system_prompt**: The system prompt that sets the behavior of the LLM.
 - **user_message_box**: The user message to send to the LLM.
 - **model**: The model to use for generation. The node automatically fetches the list of available models from OpenRouter.
+- **image_generation_only**: Filters the main model list to image generation models and makes image-generation requests more predictable for image-capable models.
 - **web_search**: Enable web search capability by appending `:online` to the model ID. This costs $4 per 1000 queries and automatically uses your openrouter balance.
 - **cheapest**: Route to the cheapest provider by appending `:floor` to the model ID (enabled by default).
 - **fastest**: Route to the fastest provider by appending `:nitro` to the model ID (disabled by default).
 - **temperature**: Controls the randomness of the model's output (0.0 to 2.0).
+- **reasoning_effort**: Uses OpenRouter's unified reasoning setting. `auto` leaves the model default unchanged; other values request a supported effort level.
+- **request_timeout**: Maximum wait for chat and image completion requests, from 1 to 3600 seconds (default: 120).
 - **chat_mode**: Enable conversation mode to maintain context across messages (disabled by default).
+
+The model list refreshes automatically every 15 minutes. Use **Refresh Models** on the node to fetch newly released models immediately; no ComfyUI restart is required.
 
 #### Optional Inputs:
 
@@ -129,7 +151,7 @@ Note: To display the output text in ComfyUI, you can use the ShowText nodes from
 6. Run the workflow
 7. The generated image will appear in the "image" output, which you can connect to preview nodes or other image processing nodes
 
-**Note**: The node automatically detects image generation requests based on keywords like "generate", "create", "draw", "make", "produce", "design", "render", "image of", "picture of", "photo of". For image generation, use models that support image output modalities.
+**Note**: The node automatically detects image generation requests based on keywords like "generate", "create", "draw", "make", "produce", "design", "render", "image of", "picture of", "photo of". It now also sends the correct OpenRouter `modalities` payload for image-capable models, including image-only models such as Flux.
 
 ### Chat Mode
 
@@ -181,6 +203,34 @@ python manage_chats.py clean -d 30
 - For cost-effective responses, enable the "cheapest" option (on by default)
 - For faster responses, disable "cheapest" and enable "fastest"
 - For web search capability, enable "web_search"
+
+### OpenRouter Video Node
+
+The repository also includes a real `OpenRouter Video` execution node.
+
+Safety behavior:
+
+- It includes its own `api_key` field
+- It validates common capability mismatches before sending the request
+- It now returns much more detailed server-side error messages when OpenRouter rejects a request
+
+Current capabilities:
+
+- Text-to-video
+- Image-to-video with `image_1`
+- Start/end-frame-to-video with `image_1` + `image_2`
+- Reference-to-video with up to 4 reference images
+- Async submit + poll + download flow for OpenRouter's `/api/v1/videos` API
+- Dynamic `mode`, `duration`, `resolution`, and `aspect_ratio` options based on the selected model
+- Minimum published duration is auto-selected when you switch models, while `auto` remains available as a manual override
+- Current public OpenRouter video catalog models are loaded dynamically, so newly released models appear without a code update
+- Estimated cost is included in the node metadata/status whenever the public pricing data is precise enough to derive it
+- Model-dependent passthrough/background controls are surfaced conservatively: the node discovers published passthrough metadata, but it does not invent a universal "transparent background" switch when the OpenRouter public catalog does not explicitly advertise one
+
+Important note:
+
+- This node has been implemented, but not validated against a live paid generation in this repository yet
+- The first real credit-consuming test should still be done deliberately, since OpenRouter video errors can be model-specific and costly
 
 ## Troubleshooting
 
