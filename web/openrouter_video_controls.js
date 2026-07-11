@@ -27,6 +27,54 @@ function getWidget(node, name) {
     return node.widgets?.find((widget) => widget.name === name) ?? null;
 }
 
+function setWidgetHidden(widget, hidden) {
+    if (!widget) {
+        return false;
+    }
+
+    const nextHidden = Boolean(hidden);
+    const previousHidden = Boolean(widget.hidden);
+    widget.hidden = nextHidden;
+    widget.options ??= {};
+    widget.options.hidden = nextHidden;
+    if (widget.inputEl) {
+        widget.inputEl.style.display = nextHidden ? "none" : "";
+    }
+    return previousHidden !== nextHidden;
+}
+
+function syncPropertiesPanelCostVisibility(node, hidden) {
+    node.__openrouterPropertyVisibility ??= {};
+    node.__openrouterPropertyVisibility[ESTIMATED_COST_WIDGET] = Boolean(hidden);
+    node.__openrouterPropertyVisibility["Estimated video cost (USD)"] = Boolean(hidden);
+
+    if (typeof document === "undefined") {
+        return;
+    }
+    const nodeId = String(node.id ?? "");
+    for (const row of document.querySelectorAll(".widget-item")) {
+        if (!row.querySelector(`[node-id="${nodeId}"]`)) {
+            continue;
+        }
+        const name = row.querySelector(".editable-text")?.textContent?.trim();
+        if (name === ESTIMATED_COST_WIDGET || name === "Estimated video cost (USD)") {
+            row.style.display = hidden ? "none" : "";
+        }
+    }
+}
+
+function resizeNodeToVisibleWidgets(node) {
+    requestAnimationFrame(() => {
+        const computedSize = node.computeSize?.();
+        if (computedSize && node.setSize) {
+            const currentWidth = Array.isArray(node.size) ? Number(node.size[0]) : 0;
+            node.setSize([Math.max(currentWidth || 0, computedSize[0]), computedSize[1]]);
+        }
+        node.setDirtyCanvas?.(true, true);
+        app.graph.setDirtyCanvas(true, true);
+    });
+}
+
 function removeWidget(node, widgetName) {
     const widget = getWidget(node, widgetName);
     if (!widget || !Array.isArray(node.widgets)) {
@@ -303,6 +351,50 @@ function estimateDurationCost(modelCapabilities, settings) {
     };
 }
 
+function estimateCentsPerSecondCost(modelCapabilities, settings) {
+    const duration = settings.duration;
+    if (!Number.isFinite(duration)) {
+        return null;
+    }
+
+    const pricingSkus = modelCapabilities.pricing_skus ?? {};
+    const candidateResolutions = settings.resolution && settings.resolution !== AUTO_VALUE
+        ? [settings.resolution]
+        : normalizeValues(modelCapabilities.supported_resolutions).length
+            ? normalizeValues(modelCapabilities.supported_resolutions)
+            : [null];
+    const imageInputCost = (parsePrice(pricingSkus.cents_per_image_input) ?? 0)
+        * (settings.imageInputCount ?? 0)
+        / 100;
+    const costs = [];
+
+    for (const resolution of candidateResolutions) {
+        const keyCandidates = [
+            ...resolutionSuffixes(resolution).map((suffix) => `cents_per_video_output_second_${suffix}`),
+            "cents_per_video_output_second",
+        ];
+        for (const skuKey of keyCandidates) {
+            const centsPerSecond = parsePrice(pricingSkus[skuKey]);
+            if (centsPerSecond == null) {
+                continue;
+            }
+            costs.push((duration * centsPerSecond) / 100 + imageInputCost);
+            break;
+        }
+    }
+
+    if (!costs.length) {
+        return null;
+    }
+
+    return {
+        display: formatCostDisplay(Math.min(...costs), Math.max(...costs)),
+        note: costs.length > 1
+            ? "Estimate spans the published per-second prices for possible resolutions."
+            : "Estimate uses the published per-second price and connected image inputs.",
+    };
+}
+
 function estimateVideoCost(modelCapabilities, settings) {
     const pricingSkus = modelCapabilities.pricing_skus ?? {};
     const pricingKeys = Object.keys(pricingSkus);
@@ -311,6 +403,14 @@ function estimateVideoCost(modelCapabilities, settings) {
             display: "N/A",
             note: "Public pricing data is not available for this model.",
         };
+    }
+
+    if (pricingKeys.some((key) => key.startsWith("cents_per_video_output_second"))) {
+        return estimateCentsPerSecondCost(modelCapabilities, settings)
+            ?? {
+                display: "N/A",
+                note: "Select a duration and resolution to estimate this model.",
+            };
     }
 
     if (pricingKeys.some((key) => key.startsWith("text_to_video_duration_seconds_") || key.startsWith("image_to_video_duration_seconds_"))) {
@@ -354,6 +454,7 @@ function ensureInfoWidgets(node) {
             estimatedCostWidget.inputEl.style.opacity = "0.85";
         }
     }
+    estimatedCostWidget.label = "Estimated video cost (USD)";
     return { estimatedCostWidget };
 }
 
@@ -378,12 +479,25 @@ function configureAdvancedProviderWidget(node) {
 }
 
 function getCurrentSettings(node) {
+    const mode = getWidget(node, "video_mode")?.value ?? "text_to_video";
+    const relevantImageInputs = mode === "image_to_video"
+        ? ["video_frame_1"]
+        : mode === "start_end_frame_to_video"
+            ? ["video_frame_1", "video_frame_2"]
+            : mode === "reference_to_video"
+                ? ["reference_image_1", "reference_image_2", "reference_image_3", "reference_image_4"]
+                : [];
+    const imageInputCount = (node.inputs ?? []).filter(
+        (input) => relevantImageInputs.includes(input.name) && input.link != null
+    ).length;
+
     return {
-        mode: getWidget(node, "video_mode")?.value ?? "text_to_video",
+        mode,
         resolution: getWidget(node, "video_resolution")?.value ?? AUTO_VALUE,
         aspectRatio: getWidget(node, "video_aspect_ratio")?.value ?? AUTO_VALUE,
         duration: parseDuration(getWidget(node, "duration")?.value),
         generateAudio: Boolean(getWidget(node, "generate_audio")?.value),
+        imageInputCount,
     };
 }
 
@@ -391,10 +505,8 @@ function syncEstimatedCost(node, capabilities) {
     const requestType = String(getWidget(node, "request_type")?.value ?? "chat");
     if (requestType !== "video") {
         const estimatedCostWidget = getWidget(node, ESTIMATED_COST_WIDGET);
-        if (estimatedCostWidget) {
-            estimatedCostWidget.hidden = true;
-        }
-        return false;
+        syncPropertiesPanelCostVisibility(node, true);
+        return setWidgetHidden(estimatedCostWidget, true);
     }
 
     const modelWidget = getWidget(node, "model");
@@ -403,14 +515,22 @@ function syncEstimatedCost(node, capabilities) {
         return false;
     }
 
-    estimatedCostWidget.hidden = false;
+    syncPropertiesPanelCostVisibility(node, false);
+    let changed = setWidgetHidden(estimatedCostWidget, false);
 
     const modelId = modelWidget.value == null ? "" : String(modelWidget.value);
     const modelCapabilities = capabilities[modelId] ?? {};
     const settings = getCurrentSettings(node);
     const estimate = estimateVideoCost(modelCapabilities, settings);
 
-    return setWidgetValue(node, estimatedCostWidget, estimate?.display ?? "N/A");
+    estimatedCostWidget.options ??= {};
+    estimatedCostWidget.options.tooltip = estimate?.note ?? "";
+    if (estimatedCostWidget.inputEl) {
+        estimatedCostWidget.inputEl.title = estimate?.note ?? "";
+    }
+
+    changed = setWidgetValue(node, estimatedCostWidget, estimate?.display ?? "N/A") || changed;
+    return changed;
 }
 
 function wrapWidgetCallback(node, widgetName, callback) {
@@ -567,13 +687,7 @@ function syncVideoWidgets(node, globals, capabilities, options = {}) {
     changed = syncEstimatedCost(node, capabilities) || changed;
 
     if (changed) {
-        requestAnimationFrame(() => {
-            const size = node.computeSize?.();
-            if (size) {
-                node.onResize?.(size);
-            }
-            app.graph.setDirtyCanvas(true, true);
-        });
+        resizeNodeToVisibleWidgets(node);
     }
 }
 
@@ -614,6 +728,11 @@ app.registerExtension({
                     requestAnimationFrame(() => {
                         syncVideoWidgets(this, globals, capabilities);
                     });
+                } else {
+                    requestAnimationFrame(() => {
+                        syncEstimatedCost(this, capabilities);
+                        resizeNodeToVisibleWidgets(this);
+                    });
                 }
             });
 
@@ -622,10 +741,8 @@ app.registerExtension({
                 if (requestType === "video") {
                     syncVideoWidgets(this, globals, capabilities);
                 } else {
-                    const estimatedCostWidget = getWidget(this, ESTIMATED_COST_WIDGET);
-                    if (estimatedCostWidget) {
-                        estimatedCostWidget.hidden = true;
-                    }
+                    syncEstimatedCost(this, capabilities);
+                    resizeNodeToVisibleWidgets(this);
                 }
             });
 
@@ -641,10 +758,8 @@ app.registerExtension({
                 if (requestType === "video") {
                     syncVideoWidgets(this, globals, capabilities);
                 } else {
-                    const estimatedCostWidget = getWidget(this, ESTIMATED_COST_WIDGET);
-                    if (estimatedCostWidget) {
-                        estimatedCostWidget.hidden = true;
-                    }
+                    syncEstimatedCost(this, capabilities);
+                    resizeNodeToVisibleWidgets(this);
                 }
             });
         };

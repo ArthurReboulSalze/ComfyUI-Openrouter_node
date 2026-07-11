@@ -84,6 +84,28 @@ class OpenRouterCatalogTests(unittest.TestCase):
         self.assertIn("vendor/image", catalog["models"])
         self.assertIn("vendor/video", catalog["models"])
 
+    def test_estimates_cents_per_second_video_pricing(self):
+        model = {
+            "supported_resolutions": ["480p", "720p"],
+            "pricing_skus": {
+                "cents_per_image_input": "0.2",
+                "cents_per_video_output_second_480p": "5",
+                "cents_per_video_output_second_720p": "7",
+            },
+        }
+        payload = {
+            "duration": 6,
+            "resolution": "720p",
+            "frame_images": [{"frame_type": "first_frame"}],
+        }
+
+        estimate = OpenRouterCatalog.estimate_video_cost(model, payload, "image_to_video")
+
+        self.assertEqual(estimate["pricing_mode"], "cents_per_video_output_second")
+        self.assertEqual(estimate["image_input_count"], 1)
+        self.assertAlmostEqual(estimate["min_cost_usd"], 0.422)
+        self.assertEqual(estimate["display_text"], "$0.4220")
+
 
 if __name__ == "__main__":
     unittest.main()
