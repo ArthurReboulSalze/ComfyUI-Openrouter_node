@@ -7,6 +7,7 @@ import requests
 
 class OpenRouterCatalog:
     MODELS_URL = "https://openrouter.ai/api/v1/models?output_modalities=all"
+    IMAGE_MODELS_URL = "https://openrouter.ai/api/v1/images/models"
     VIDEO_MODELS_URL = "https://openrouter.ai/api/v1/videos/models"
     CACHE_DURATION = 3600
     VIDEO_RESOLUTION_ORDER = ["480p", "720p", "1080p", "1K", "2K", "4K"]
@@ -14,6 +15,8 @@ class OpenRouterCatalog:
 
     _all_models_cache: Optional[List[Dict[str, Any]]] = None
     _all_models_timestamp = 0.0
+    _image_models_cache: Optional[List[Dict[str, Any]]] = None
+    _image_models_timestamp = 0.0
     _video_models_cache: Optional[List[Dict[str, Any]]] = None
     _video_models_timestamp = 0.0
 
@@ -139,8 +142,12 @@ class OpenRouterCatalog:
         return cls._normalize_modalities(modalities)
 
     @classmethod
-    def fetch_all_models(cls) -> List[Dict[str, Any]]:
-        if cls._all_models_cache is not None and cls._is_cache_valid(cls._all_models_timestamp):
+    def fetch_all_models(cls, force_refresh: bool = False) -> List[Dict[str, Any]]:
+        if (
+            not force_refresh
+            and cls._all_models_cache is not None
+            and cls._is_cache_valid(cls._all_models_timestamp)
+        ):
             return cls._all_models_cache
 
         try:
@@ -157,6 +164,36 @@ class OpenRouterCatalog:
             return cls._all_models_cache
 
         return []
+
+    @classmethod
+    def fetch_image_models(cls, force_refresh: bool = False) -> List[Dict[str, Any]]:
+        """Return the dedicated image catalog, retaining stale data on API errors."""
+        if (
+            not force_refresh
+            and cls._image_models_cache is not None
+            and cls._is_cache_valid(cls._image_models_timestamp)
+        ):
+            return cls._image_models_cache
+
+        try:
+            result = cls._fetch_json(cls.IMAGE_MODELS_URL)
+            models = result.get("data", [])
+            if isinstance(models, list) and models:
+                cls._image_models_cache = models
+                cls._image_models_timestamp = time.time()
+                return models
+        except requests.exceptions.RequestException as exc:
+            print(f"Error fetching OpenRouter image models catalog: {exc}")
+
+        if cls._image_models_cache is not None:
+            return cls._image_models_cache
+
+        # The general catalog remains a useful fallback for image-capable chat models.
+        return [
+            model
+            for model in cls.fetch_all_models()
+            if "image" in cls._extract_output_modalities(model)
+        ]
 
     @classmethod
     def fetch_chat_model_ids(cls) -> List[str]:
@@ -186,7 +223,7 @@ class OpenRouterCatalog:
 
     @classmethod
     def fetch_image_generation_model_ids(cls) -> List[str]:
-        models = cls.fetch_all_models()
+        models = cls.fetch_image_models()
         if not models:
             return cls.FALLBACK_IMAGE_MODELS
 
@@ -201,11 +238,11 @@ class OpenRouterCatalog:
                 model_ids.append(model_id)
 
         model_ids = sorted(set(model_ids))
-        return model_ids if model_ids else cls.FALLBACK_CHAT_MODELS
+        return model_ids if model_ids else cls.FALLBACK_IMAGE_MODELS
 
     @classmethod
     def fetch_image_only_model_ids(cls) -> List[str]:
-        models = cls.fetch_all_models()
+        models = cls.fetch_image_models()
         if not models:
             return cls.FALLBACK_IMAGE_ONLY_MODELS
 
@@ -225,29 +262,27 @@ class OpenRouterCatalog:
     @classmethod
     def fetch_image_widget_capabilities(cls) -> Dict[str, Dict[str, Any]]:
         capabilities: Dict[str, Dict[str, Any]] = {}
-        for model in cls.fetch_all_models():
+        for model in cls.fetch_image_models():
             model_id = model.get("id")
             if not isinstance(model_id, str):
                 continue
 
             output_modalities = cls._extract_output_modalities(model)
             output_modalities_set = set(output_modalities)
-            if output_modalities_set != {"image"}:
-                continue
-
             capabilities[model_id] = {
                 "output_modalities": output_modalities,
                 "supports_image_generation": True,
-                "is_image_only": True,
+                "is_image_only": output_modalities_set == {"image"},
             }
 
-        for model_id in cls.FALLBACK_IMAGE_ONLY_MODELS:
+        for model_id in cls.FALLBACK_IMAGE_MODELS:
+            is_image_only = model_id in cls.FALLBACK_IMAGE_ONLY_MODELS
             capabilities.setdefault(
                 model_id,
                 {
-                    "output_modalities": ["image"],
+                    "output_modalities": ["image"] if is_image_only else ["text", "image"],
                     "supports_image_generation": True,
-                    "is_image_only": True,
+                    "is_image_only": is_image_only,
                 },
             )
 
@@ -270,6 +305,25 @@ class OpenRouterCatalog:
                 "is_image_only": output_modalities_set == {"image"},
             }
 
+        # The dedicated endpoint is the source of truth for generation support.
+        # Some legacy image models are not classified as image outputs by /models.
+        for model in cls.fetch_image_models():
+            model_id = model.get("id")
+            if not isinstance(model_id, str):
+                continue
+            output_modalities = cls._extract_output_modalities(model)
+            output_modalities_set = set(output_modalities)
+            capability = capabilities.setdefault(
+                model_id,
+                {
+                    "output_modalities": output_modalities,
+                    "supports_text_output": "text" in output_modalities_set,
+                    "is_image_only": output_modalities_set == {"image"},
+                },
+            )
+            capability["supports_image_generation"] = True
+            capability["is_image_only"] = output_modalities_set == {"image"}
+
         for model_id in cls.FALLBACK_CHAT_MODELS:
             capabilities.setdefault(
                 model_id,
@@ -285,6 +339,12 @@ class OpenRouterCatalog:
 
     @classmethod
     def get_chat_model_by_id(cls, model_id: str) -> Dict[str, Any]:
+        # Prefer the dedicated image metadata because /models can lag behind
+        # its image-generation classification for legacy entries.
+        for model in cls.fetch_image_models():
+            if model.get("id") == model_id:
+                return model
+
         for model in cls.fetch_all_models():
             if model.get("id") == model_id:
                 return model
@@ -297,8 +357,12 @@ class OpenRouterCatalog:
         }
 
     @classmethod
-    def fetch_video_models(cls) -> List[Dict[str, Any]]:
-        if cls._video_models_cache is not None and cls._is_cache_valid(cls._video_models_timestamp):
+    def fetch_video_models(cls, force_refresh: bool = False) -> List[Dict[str, Any]]:
+        if (
+            not force_refresh
+            and cls._video_models_cache is not None
+            and cls._is_cache_valid(cls._video_models_timestamp)
+        ):
             return cls._video_models_cache
 
         try:
@@ -743,7 +807,7 @@ class OpenRouterCatalog:
     @classmethod
     def fetch_unified_model_ids(cls) -> List[str]:
         chat_ids = cls.fetch_chat_model_ids()
-        image_ids = cls.fetch_image_only_model_ids()
+        image_ids = cls.fetch_image_generation_model_ids()
         video_ids = cls.fetch_video_model_ids()
         seen: set = set()
         combined: List[str] = []
@@ -757,6 +821,38 @@ class OpenRouterCatalog:
                     seen.add(model_id)
                     combined.append(model_id)
         return combined
+
+    @classmethod
+    def build_widget_catalog(cls, force_refresh: bool = False) -> Dict[str, Any]:
+        """Build the browser payload and optionally bypass the in-memory TTL."""
+        if force_refresh:
+            # Each fetch keeps its previous successful cache if OpenRouter is unavailable.
+            cls.fetch_all_models(force_refresh=True)
+            cls.fetch_image_models(force_refresh=True)
+            cls.fetch_video_models(force_refresh=True)
+
+        chat_capabilities = cls.fetch_chat_widget_capabilities()
+        image_capabilities = cls.fetch_image_widget_capabilities()
+        video_capabilities = cls.fetch_video_widget_capabilities()
+        model_ids = cls.fetch_unified_model_ids()
+        return {
+            "models": model_ids,
+            "chat_capabilities": chat_capabilities,
+            "image_capabilities": image_capabilities,
+            "video_capabilities": video_capabilities,
+            "counts": {
+                "all": len(cls.fetch_all_models()),
+                "chat": len(cls.fetch_chat_model_ids()),
+                "image": len(cls.fetch_image_generation_model_ids()),
+                "video": len(cls.fetch_video_model_ids()),
+                "unified": len(model_ids),
+            },
+            "updated_at": max(
+                cls._all_models_timestamp,
+                cls._image_models_timestamp,
+                cls._video_models_timestamp,
+            ),
+        }
 
     @classmethod
     def get_video_model_by_id(cls, model_id: str) -> Dict[str, Any]:

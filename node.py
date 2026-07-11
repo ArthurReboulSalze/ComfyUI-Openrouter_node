@@ -39,6 +39,10 @@ class OpenRouterNode:
     """
 
     API_BASE = "https://openrouter.ai/api/v1"
+    DEFAULT_REQUEST_TIMEOUT = 120
+    MIN_REQUEST_TIMEOUT = 1
+    MAX_REQUEST_TIMEOUT = 3600
+    REASONING_EFFORT_OPTIONS = ("auto", "none", "minimal", "low", "medium", "high", "xhigh")
 
     def __init__(self):
         self.chat_manager = ChatSessionManager()
@@ -55,9 +59,23 @@ class OpenRouterNode:
         except (FileNotFoundError, OSError):
             return ""
 
+    @classmethod
+    def _read_json_api_key(cls) -> str:
+        config_path = os.path.join(os.path.dirname(__file__), "openrouter_api_key.json")
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            key = data.get("api_key", "") if isinstance(data, dict) else ""
+            return key.strip() if isinstance(key, str) else ""
+        except (FileNotFoundError, OSError, json.JSONDecodeError):
+            return ""
+
     @staticmethod
     def _read_env_api_key() -> str:
-        return os.environ.get("OPENROUTER_API_KEY", "").strip()
+        return (
+            os.environ.get("OPENROUTER_API_KEY", "").strip()
+            or os.environ.get("LLM_KEY", "").strip()
+        )
 
     @classmethod
     def _save_api_key(cls, api_key: str) -> None:
@@ -80,6 +98,9 @@ class OpenRouterNode:
         saved = self._read_saved_api_key()
         if saved:
             return saved
+        configured = self._read_json_api_key()
+        if configured:
+            return configured
         return self._read_env_api_key()
 
     @classmethod
@@ -141,6 +162,13 @@ class OpenRouterNode:
                 }),
                 "pdf_engine": (["auto", "mistral-ocr", "pdf-text"], {"default": "auto"}),
                 "chat_mode": ("BOOLEAN", {"default": False}),
+                "reasoning_effort": (list(cls.REASONING_EFFORT_OPTIONS), {"default": "auto"}),
+                "request_timeout": ("INT", {
+                    "default": cls.DEFAULT_REQUEST_TIMEOUT,
+                    "min": cls.MIN_REQUEST_TIMEOUT,
+                    "max": cls.MAX_REQUEST_TIMEOUT,
+                    "step": 1,
+                }),
 
                 "video_mode": (VIDEO_MODES, {"default": "text_to_video"}),
                 "video_prompt": ("STRING", {"multiline": True, "default": ""}),
@@ -185,7 +213,23 @@ class OpenRouterNode:
         except (ValueError, TypeError):
             return 1.0
 
-    def fetch_credits(self, api_key):
+    @classmethod
+    def validate_request_timeout(cls, request_timeout):
+        try:
+            timeout = int(request_timeout)
+            return max(cls.MIN_REQUEST_TIMEOUT, min(cls.MAX_REQUEST_TIMEOUT, timeout))
+        except (ValueError, TypeError):
+            return cls.DEFAULT_REQUEST_TIMEOUT
+
+    @classmethod
+    def validate_reasoning_effort(cls, reasoning_effort):
+        if isinstance(reasoning_effort, str):
+            normalized = reasoning_effort.strip().lower()
+            if normalized in cls.REASONING_EFFORT_OPTIONS:
+                return normalized
+        return "auto"
+
+    def fetch_credits(self, api_key, timeout=None):
         if not api_key:
             return "API Key not provided."
 
@@ -198,7 +242,11 @@ class OpenRouterNode:
         }
 
         try:
-            response = requests.get(url, headers=headers)
+            response = requests.get(
+                url,
+                headers=headers,
+                timeout=self.validate_request_timeout(timeout),
+            )
             response.raise_for_status()
 
             result = response.json()
@@ -766,6 +814,8 @@ class OpenRouterNode:
         temperature,
         pdf_engine,
         chat_mode,
+        reasoning_effort,
+        request_timeout,
         video_mode,
         video_prompt,
         video_resolution,
@@ -818,6 +868,7 @@ class OpenRouterNode:
                 aspect_ratio=aspect_ratio,
                 image_resolution=image_resolution,
                 temperature=temperature,
+                request_timeout=request_timeout,
                 user_message_input=user_message_input,
                 **kwargs,
             )
@@ -837,6 +888,8 @@ class OpenRouterNode:
                 temperature=temperature,
                 pdf_engine=pdf_engine,
                 chat_mode=chat_mode,
+                reasoning_effort=reasoning_effort,
+                request_timeout=request_timeout,
                 pdf_data=pdf_data,
                 user_message_input=user_message_input,
                 **kwargs,
@@ -858,6 +911,8 @@ class OpenRouterNode:
         temperature,
         pdf_engine,
         chat_mode,
+        reasoning_effort,
+        request_timeout,
         pdf_data=None,
         user_message_input=None,
         **kwargs,
@@ -876,6 +931,8 @@ class OpenRouterNode:
         }
 
         validated_temp = self.validate_temperature(temperature)
+        validated_timeout = self.validate_request_timeout(request_timeout)
+        validated_reasoning_effort = self.validate_reasoning_effort(reasoning_effort)
 
         user_text = user_message_input if user_message_input is not None and user_message_input.strip() else user_message_box
 
@@ -974,6 +1031,8 @@ class OpenRouterNode:
             "temperature": validated_temp,
             "seed": seed
         }
+        if validated_reasoning_effort != "auto":
+            data["reasoning"] = {"effort": validated_reasoning_effort}
 
         image_generation_requested = (
             self.is_image_generation_model(selected_model) and (
@@ -1016,7 +1075,7 @@ class OpenRouterNode:
 
         try:
             start_time = time.time()
-            response = requests.post(url, headers=headers, json=data)
+            response = requests.post(url, headers=headers, json=data, timeout=validated_timeout)
             response.raise_for_status()
             end_time = time.time()
 
@@ -1097,8 +1156,10 @@ class OpenRouterNode:
                 stats_text += f", PDF Engine: {pdf_engine}"
             if image_generation_requested:
                 stats_text += ", Image Generation: enabled"
+            if validated_reasoning_effort != "auto":
+                stats_text += f", Reasoning: {validated_reasoning_effort}"
 
-            credits_text = self.fetch_credits(api_key)
+            credits_text = self.fetch_credits(api_key, timeout=validated_timeout)
 
             if chat_mode and session_path:
                 assistant_message = {
@@ -1138,6 +1199,7 @@ class OpenRouterNode:
         aspect_ratio,
         image_resolution,
         temperature,
+        request_timeout,
         user_message_input=None,
         **kwargs,
     ):
@@ -1155,6 +1217,7 @@ class OpenRouterNode:
         }
 
         validated_temp = self.validate_temperature(temperature)
+        validated_timeout = self.validate_request_timeout(request_timeout)
 
         user_text = user_message_input if user_message_input is not None and user_message_input.strip() else user_message_box
 
@@ -1220,7 +1283,7 @@ class OpenRouterNode:
 
         try:
             start_time = time.time()
-            response = requests.post(url, headers=headers, json=data)
+            response = requests.post(url, headers=headers, json=data, timeout=validated_timeout)
             response.raise_for_status()
             end_time = time.time()
 
@@ -1294,7 +1357,7 @@ class OpenRouterNode:
                 f"Image Generation: enabled"
             )
 
-            credits_text = self.fetch_credits(api_key)
+            credits_text = self.fetch_credits(api_key, timeout=validated_timeout)
 
             return (text_output, image_tensor, placeholder_video, stats_text, credits_text, "")
 
@@ -1431,6 +1494,7 @@ class OpenRouterNode:
                    system_prompt, user_message_box, image_generation_only,
                    web_search, cheapest, fastest, aspect_ratio,
                    image_resolution, temperature, pdf_engine, chat_mode,
+                   reasoning_effort, request_timeout,
                    video_mode, video_prompt, video_resolution,
                    video_aspect_ratio, duration, generate_audio,
                    poll_interval_seconds, timeout_seconds, provider_json,
@@ -1487,10 +1551,14 @@ class OpenRouterNode:
         except (ValueError, TypeError):
             temp_float = 1.0
 
+        timeout_int = cls.validate_request_timeout(request_timeout)
+        validated_reasoning_effort = cls.validate_reasoning_effort(reasoning_effort)
+
         return (api_key, request_type, model, seed,
                 system_prompt, user_message_box, image_generation_only,
                 web_search, cheapest, fastest, aspect_ratio,
                 image_resolution, temp_float, pdf_engine, chat_mode,
+                validated_reasoning_effort, timeout_int,
                 video_mode, video_prompt, video_resolution,
                 video_aspect_ratio, duration, generate_audio,
                 poll_interval_seconds, timeout_seconds, provider_json,

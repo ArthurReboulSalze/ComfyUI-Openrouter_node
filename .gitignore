@@ -44,3 +44,5 @@ api_keys.json
 secrets.json
 *.key
 openrouter_api_key.txt
+openrouter_api_key.json
+chats/

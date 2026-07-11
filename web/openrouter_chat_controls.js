@@ -1,6 +1,12 @@
 import { app } from "../../../scripts/app.js"
 
 const NODE_IDS = new Set(["OpenRouterNode", "openrouter_node"]);
+const CATALOG_REFRESH_INTERVAL_MS = 15 * 60 * 1000;
+const CATALOG_FORCE_DEDUP_MS = 30 * 1000;
+
+let catalogCache = null;
+let catalogRequest = null;
+let lastForcedCatalogRequest = 0;
 
 const CHAT_ONLY_WIDGETS = [
     "system_prompt",
@@ -8,6 +14,7 @@ const CHAT_ONLY_WIDGETS = [
     "web_search",
     "pdf_engine",
     "chat_mode",
+    "reasoning_effort",
 ];
 
 const IMAGE_ONLY_WIDGETS = [];
@@ -19,6 +26,7 @@ const CHAT_SHARED_WIDGETS = [
     "aspect_ratio",
     "image_resolution",
     "temperature",
+    "request_timeout",
 ];
 
 const VIDEO_WIDGETS = [
@@ -52,6 +60,45 @@ function normalizeValues(values) {
         ordered.push(text);
     }
     return ordered;
+}
+
+async function requestModelCatalog(forceRefresh = false) {
+    const now = Date.now();
+    const shouldForce = forceRefresh
+        && (!catalogCache || now - lastForcedCatalogRequest >= CATALOG_FORCE_DEDUP_MS);
+
+    if (catalogRequest) {
+        return catalogRequest;
+    }
+    if (forceRefresh && !shouldForce && catalogCache) {
+        return catalogCache;
+    }
+
+    catalogRequest = fetch(`/openrouter/model_catalog${shouldForce ? "?refresh=1" : ""}`, {
+        cache: "no-store",
+    })
+        .then(async (response) => {
+            const data = await response.json();
+            if (!response.ok || data.success === false) {
+                throw new Error(data.error || `HTTP ${response.status}`);
+            }
+            if (shouldForce) {
+                lastForcedCatalogRequest = Date.now();
+            }
+            catalogCache = data;
+            return data;
+        })
+        .finally(() => {
+            catalogRequest = null;
+        });
+    return catalogRequest;
+}
+
+function replaceObjectContents(target, source) {
+    for (const key of Object.keys(target)) {
+        delete target[key];
+    }
+    Object.assign(target, source ?? {});
 }
 
 function getWidget(node, name) {
@@ -185,7 +232,7 @@ function syncModelList(node, requestType, chatCapabilities, imageCapabilities, v
     }
 }
 
-function syncChatModelFilter(node, globals, chatCapabilities) {
+function syncChatModelFilter(node, globals, chatCapabilities, videoCapabilities = {}) {
     const modelWidget = getWidget(node, "model");
     const imageOnlyWidget = getWidget(node, "image_generation_only");
     if (!modelWidget || !imageOnlyWidget) {
@@ -198,8 +245,9 @@ function syncChatModelFilter(node, globals, chatCapabilities) {
     }
 
     const imageGenerationOnly = Boolean(imageOnlyWidget.value);
-    const chatModelIds = Object.keys(chatCapabilities).filter(
-        (id) => !chatCapabilities[id].is_image_only
+    const videoIds = new Set(Object.keys(videoCapabilities));
+    const chatModelIds = globals.allModelValues.filter(
+        (id) => chatCapabilities[id] && !chatCapabilities[id].is_image_only && !videoIds.has(id)
     );
     const filteredValues = imageGenerationOnly
         ? chatModelIds.filter((modelId) => chatCapabilities[modelId]?.supports_image_generation)
@@ -219,6 +267,81 @@ function syncChatModelFilter(node, globals, chatCapabilities) {
             app.graph.setDirtyCanvas(true, true);
         });
     }
+}
+
+function configureModelCatalog(node, globals, chatCapabilities, imageCapabilities, videoCapabilities) {
+    if (node.__openrouterCatalogConfigured) {
+        return;
+    }
+    node.__openrouterCatalogConfigured = true;
+
+    let statusWidget = getWidget(node, "openrouter_model_catalog_status");
+    if (!statusWidget) {
+        statusWidget = node.addWidget(
+            "text",
+            "openrouter_model_catalog_status",
+            "Models: synchronizing...",
+            () => {},
+            { readonly: true, serialize: false },
+        );
+        statusWidget.serializeValue = () => undefined;
+        if (statusWidget.inputEl) {
+            statusWidget.inputEl.readOnly = true;
+        }
+    }
+
+    const applyCatalog = (catalog) => {
+        const models = normalizeValues(catalog.models);
+        globals.allModelValues.splice(0, globals.allModelValues.length, ...models);
+        replaceObjectContents(chatCapabilities, catalog.chat_capabilities);
+        replaceObjectContents(imageCapabilities, catalog.image_capabilities);
+        replaceObjectContents(videoCapabilities, catalog.video_capabilities);
+
+        const requestType = String(getWidget(node, "request_type")?.value ?? "chat");
+        syncModelList(node, requestType, chatCapabilities, imageCapabilities, videoCapabilities, globals.allModelValues);
+        if (requestType === "chat") {
+            syncChatModelFilter(node, globals, chatCapabilities, videoCapabilities);
+        } else if (requestType === "video") {
+            const modelWidget = getWidget(node, "model");
+            modelWidget?.callback?.(modelWidget.value);
+        }
+
+        const counts = catalog.counts ?? {};
+        const updatedAt = catalog.updated_at ? new Date(catalog.updated_at * 1000).toLocaleTimeString() : "now";
+        statusWidget.value = `Models: ${counts.chat ?? 0} chat / ${counts.image ?? 0} image / ${counts.video ?? 0} video (${updatedAt})`;
+        app.graph.setDirtyCanvas(true, true);
+    };
+
+    const refresh = async (forceRefresh = true) => {
+        statusWidget.value = "Models: synchronizing...";
+        try {
+            applyCatalog(await requestModelCatalog(forceRefresh));
+        } catch (error) {
+            statusWidget.value = `Model refresh failed: ${error.message}`;
+            app.graph.setDirtyCanvas(true, true);
+        }
+    };
+
+    const buttonWidget = node.addWidget(
+        "button",
+        "openrouter_model_catalog_refresh",
+        "Refresh Models",
+        () => refresh(true),
+        { serialize: false },
+    );
+    buttonWidget.serializeValue = () => undefined;
+
+    refresh(true);
+    node.__openrouterCatalogTimer = window.setInterval(() => refresh(true), CATALOG_REFRESH_INTERVAL_MS);
+
+    const onRemoved = node.onRemoved;
+    node.onRemoved = function () {
+        if (this.__openrouterCatalogTimer) {
+            window.clearInterval(this.__openrouterCatalogTimer);
+            this.__openrouterCatalogTimer = null;
+        }
+        return onRemoved?.apply(this, arguments);
+    };
 }
 
 function wrapWidgetCallback(node, widgetName, callback) {
@@ -322,9 +445,12 @@ function configureApiKeyWidget(node) {
             if (data.saved && data.masked) {
                 apiKeyWidget.value = data.masked;
                 if (statusWidget) {
-                    statusWidget.value = data.source === "env"
-                        ? `API key loaded from environment: ${data.masked}`
-                        : `API key saved locally: ${data.masked}`;
+                    const environmentSources = new Set(["OPENROUTER_API_KEY", "LLM_KEY"]);
+                    statusWidget.value = environmentSources.has(data.source)
+                        ? `API key loaded from ${data.source}: ${data.masked}`
+                        : data.source === "json"
+                            ? `API key loaded from JSON config: ${data.masked}`
+                            : `API key saved locally: ${data.masked}`;
                 }
             } else if (statusWidget) {
                 statusWidget.value = "API key: not set";
@@ -353,6 +479,7 @@ app.registerExtension({
 
             syncWidgetVisibility(this, "chat");
             configureApiKeyWidget(this);
+            configureModelCatalog(this, globals, chatCapabilities, imageCapabilities, videoCapabilities);
 
             wrapWidgetCallback(this, "request_type", () => {
                 const requestType = String(getWidget(this, "request_type")?.value ?? "chat");
@@ -361,14 +488,14 @@ app.registerExtension({
             });
 
             wrapWidgetCallback(this, "image_generation_only", () => {
-                syncChatModelFilter(this, globals, chatCapabilities);
+                syncChatModelFilter(this, globals, chatCapabilities, videoCapabilities);
             });
 
             requestAnimationFrame(() => {
                 const requestType = String(getWidget(this, "request_type")?.value ?? "chat");
                 syncWidgetVisibility(this, requestType);
                 syncModelList(this, requestType, chatCapabilities, imageCapabilities, videoCapabilities, globals.allModelValues);
-                syncChatModelFilter(this, globals, chatCapabilities);
+                syncChatModelFilter(this, globals, chatCapabilities, videoCapabilities);
             });
 
             return result;
@@ -378,11 +505,12 @@ app.registerExtension({
         nodeType.prototype.onConfigure = function () {
             onConfigure?.apply(this, arguments);
             configureApiKeyWidget(this);
+            configureModelCatalog(this, globals, chatCapabilities, imageCapabilities, videoCapabilities);
             requestAnimationFrame(() => {
                 const requestType = String(getWidget(this, "request_type")?.value ?? "chat");
                 syncWidgetVisibility(this, requestType);
                 syncModelList(this, requestType, chatCapabilities, imageCapabilities, videoCapabilities, globals.allModelValues);
-                syncChatModelFilter(this, globals, chatCapabilities);
+                syncChatModelFilter(this, globals, chatCapabilities, videoCapabilities);
             });
         };
     },
