@@ -2,24 +2,6 @@
 
 A custom node for ComfyUI that allows you to interact with OpenRouter's API, providing access to a wide range of models.
 
-## How this fork differs from the original
-
-This fork is based on [gabe-init/ComfyUI-Openrouter_node](https://github.com/gabe-init/ComfyUI-Openrouter_node) and keeps its secure API-key handling, reasoning-effort control, and configurable request timeout. Compared with upstream `main` at [`45c67f9`](https://github.com/gabe-init/ComfyUI-Openrouter_node/commit/45c67f9) (checked July 11, 2026), this fork adds:
-
-| Area | This fork |
-| --- | --- |
-| Unified workflow | One backward-compatible node switches between chat, image, and video requests. Its visible controls and the ComfyUI Parameters panel adapt to the selected request type. |
-| Live model catalogs | Chat, image, and video catalogs are synchronized from OpenRouter, refreshed automatically every 15 minutes, and refreshable on demand without restarting ComfyUI. The last valid catalog remains available during a temporary API failure. |
-| Video generation | Direct asynchronous `/api/v1/videos` submission, polling, and download with text-to-video, image-to-video, start/end-frame, and reference-image modes. Model-specific durations, resolutions, aspect ratios, audio, and provider options come from published capabilities. |
-| Cost estimate | The video UI estimates cost from OpenRouter's published pricing SKUs, including duration/resolution, per-second video, audio, and connected image-input pricing where available. |
-| Credit refresh | **Refresh Credits** reads the current balance without running a generation. The node's `Credits` output is refreshed on the next workflow execution. |
-| Linked prompts | A non-empty `user_message_input` overrides the internal chat/image prompt or `video_prompt`, so one connected string can drive every request type. |
-| Workflow compatibility | Existing workflows are migrated when new controls change the serialized widget order, preventing old video settings from being assigned to unrelated inputs. The legacy node ID remains supported. |
-| Image generation | Dedicated image-model filtering, broader image-model discovery, OpenRouter `modalities` payloads, and compatibility with image-only models such as Flux. |
-| Regression coverage | Python tests cover request settings, catalogs, pricing, credits, and prompt routing; JavaScript tests cover adaptive visibility, video pricing, model-refresh parsing, and legacy workflow migration. |
-
-The original project may continue to change after the comparison point above. Features accepted upstream can therefore disappear from this list in future releases.
-
 ## Updates
 
 ### 7/11/2026 - Live Model Catalog Refresh
@@ -29,6 +11,18 @@ The original project may continue to change after the comparison point above. Fe
 - Adds a **Refresh Models** button for an immediate refresh without restarting ComfyUI
 - Keeps the last successful catalog in memory if OpenRouter is temporarily unavailable
 - Includes the upstream `reasoning_effort`, request timeout, `LLM_KEY`, and `openrouter_api_key.json` improvements
+
+### 5/18/2026
+
+Reasoning effort setting added. Make sure the model supports reasoning when using it.
+
+### 5/9/2026 - Secure API Key Loading
+
+You can load your API key from a JSON config or environment variable instead of placing it in workflow metadata.
+
+- **JSON config:** put `{"api_key": "your_key_here"}` in `openrouter_api_key.json` in the node directory
+- **Environment variable:** set `OPENROUTER_API_KEY` or `LLM_KEY`
+- **Node UI:** use **Set API Key** to save the key locally without serializing it into the workflow
 
 ### 4/5/2026 - Seed, Resolution, Aspect Ratio, Temperature Fix
 - Added **seed** input
@@ -74,7 +68,7 @@ Added a new Chat Mode feature that lets you store context to enable conversation
 1. Clone this repository into your ComfyUI custom_nodes folder:
 ```bash
 cd ComfyUI/custom_nodes
-git clone https://github.com/ArthurReboulSalze/ComfyUI-Openrouter_node
+git clone https://github.com/gabe-init/ComfyUI-Openrouter_node
 ```
 
 2. Install the required dependencies:
@@ -90,7 +84,16 @@ The OpenRouter node provides a simple interface to interact with various LLMs th
 
 ### API Key Security
 
-The node's **Set API Key** button stores the key locally and prevents it from being serialized into workflow metadata. For compatibility with the original node, you can alternatively use `OPENROUTER_API_KEY`, `LLM_KEY`, or an ignored `openrouter_api_key.json` file based on `openrouter_api_key.json.example`.
+> [!WARNING]
+> API keys must not be stored in workflow metadata, especially when generated images or workflows will be shared.
+
+Use one of these methods:
+
+1. **Set API Key button (recommended for the node UI):** enter the key, click **Set API Key**, and the node stores it in the ignored local `openrouter_api_key.txt` file. The key value is not serialized into the workflow.
+2. **JSON config:** create `openrouter_api_key.json` from `openrouter_api_key.json.example`, then leave the UI field blank.
+3. **Environment variable:** set `OPENROUTER_API_KEY` or `LLM_KEY`, then leave the UI field blank.
+
+The node resolves keys in this order: a newly entered key, the locally saved key, the JSON config, and finally the environment variables.
 
 ### Inputs
 
@@ -132,7 +135,7 @@ Note: To display the output text in ComfyUI, you can use the ShowText nodes from
 ### Basic Text Generation
 
 1. Add the OpenRouter node to your workflow
-2. Enter your API key
+2. Configure your API key with **Set API Key**
 3. Set a system prompt (e.g., "You are a helpful assistant.")
 4. Enter a user message (e.g., "Explain quantum computing in simple terms.")
 5. Select a model (e.g., "openai/gpt-4")
@@ -142,7 +145,7 @@ Note: To display the output text in ComfyUI, you can use the ShowText nodes from
 
 1. Add the OpenRouter node to your workflow
 2. Connect an image output from another node to the "image_1" input
-3. Enter your API key
+3. Configure your API key with **Set API Key**
 4. Set a system prompt (e.g., "You are a helpful assistant.")
 5. Enter a user message (e.g., "Describe this image in detail.")
 6. Select a multimodal model (e.g., "openai/gpt-4-vision" or "anthropic/claude-3-opus-20240229")
@@ -163,7 +166,7 @@ Note: To display the output text in ComfyUI, you can use the ShowText nodes from
 ### Image Generation
 
 1. Add the OpenRouter node to your workflow
-2. Enter your API key
+2. Configure your API key with **Set API Key**
 3. Set a system prompt (e.g., "You are a helpful assistant.")
 4. Enter a user message with generation keywords (e.g., "Generate a beautiful sunset over mountains", "Create an image of a futuristic city", "Draw a cat wearing a hat")
 5. Select an image-capable model (e.g., "google/gemini-2.5-flash-image-preview" - also known as Nano-Banana)
@@ -229,16 +232,16 @@ Set `request_type` to `video` in the unified `OpenRouter (Chat / Image / Video)`
 
 Safety behavior:
 
-- It includes its own `api_key` field
+- It uses the same secure API-key configuration as chat and image requests
 - It validates common capability mismatches before sending the request
 - It now returns much more detailed server-side error messages when OpenRouter rejects a request
 
 Current capabilities:
 
 - Text-to-video
-- Image-to-video with `image_1`
-- Start/end-frame-to-video with `image_1` + `image_2`
-- Reference-to-video with up to 4 reference images
+- Image-to-video with `video_frame_1`
+- Start/end-frame-to-video with `video_frame_1` + `video_frame_2`
+- Reference-to-video with `reference_image_1` through `reference_image_4`
 - Async submit + poll + download flow for OpenRouter's `/api/v1/videos` API
 - Dynamic `mode`, `duration`, `resolution`, and `aspect_ratio` options based on the selected model
 - Minimum published duration is auto-selected when you switch models, while `auto` remains available as a manual override
@@ -248,8 +251,8 @@ Current capabilities:
 
 Important note:
 
-- This node has been implemented, but not validated against a live paid generation in this repository yet
-- The first real credit-consuming test should still be done deliberately, since OpenRouter video errors can be model-specific and costly
+- Chat, image, and video paths have been exercised in ComfyUI, but OpenRouter support and pricing remain model-specific
+- Run credit-consuming video tests deliberately because capability or provider errors can still consume time or credits
 
 ## Troubleshooting
 

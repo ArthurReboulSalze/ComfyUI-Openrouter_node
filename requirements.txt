@@ -1,3 +1,3 @@
-requests
-tiktoken
-Pillow
+requests  # OpenRouter API and generated media downloads
+tiktoken  # accurate LLM token counting
+Pillow    # image processing
