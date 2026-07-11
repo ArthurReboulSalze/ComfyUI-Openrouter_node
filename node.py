@@ -229,7 +229,8 @@ class OpenRouterNode:
                 return normalized
         return "auto"
 
-    def fetch_credits(self, api_key, timeout=None):
+    @classmethod
+    def fetch_credits(cls, api_key, timeout=None):
         if not api_key:
             return "API Key not provided."
 
@@ -245,7 +246,7 @@ class OpenRouterNode:
             response = requests.get(
                 url,
                 headers=headers,
-                timeout=self.validate_request_timeout(timeout),
+                timeout=cls.validate_request_timeout(timeout),
             )
             response.raise_for_status()
 
@@ -836,13 +837,18 @@ class OpenRouterNode:
         **kwargs,
     ):
         api_key = self._resolve_api_key(api_key)
+        linked_prompt = (
+            user_message_input.strip()
+            if isinstance(user_message_input, str) and user_message_input.strip()
+            else None
+        )
         if request_type == "video":
             return self._generate_video(
                 api_key=api_key,
                 model=model,
                 seed=seed,
                 video_mode=video_mode,
-                video_prompt=video_prompt,
+                video_prompt=linked_prompt or video_prompt,
                 video_resolution=video_resolution,
                 video_aspect_ratio=video_aspect_ratio,
                 duration=duration,

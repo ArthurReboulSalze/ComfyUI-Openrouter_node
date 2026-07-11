@@ -700,6 +700,67 @@ class OpenRouterCatalog:
         }
 
     @classmethod
+    def _estimate_cents_per_second_video_cost(
+        cls,
+        model: Dict[str, Any],
+        pricing_skus: Dict[str, Any],
+        payload: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        duration = payload.get("duration")
+        if not isinstance(duration, int):
+            return None
+
+        candidate_resolutions = (
+            [payload.get("resolution")]
+            if payload.get("resolution") not in (None, "", "auto")
+            else cls._ordered_video_resolutions(model.get("supported_resolutions")) or [None]
+        )
+        image_input_count = len(payload.get("frame_images") or []) + len(
+            payload.get("input_references") or []
+        )
+        cents_per_image = cls._parse_price(pricing_skus.get("cents_per_image_input")) or 0.0
+        image_input_cost = image_input_count * cents_per_image / 100
+
+        matches = []
+        for resolution in candidate_resolutions:
+            key_candidates = [
+                f"cents_per_video_output_second_{suffix}"
+                for suffix in cls._resolution_suffixes(resolution)
+            ]
+            key_candidates.append("cents_per_video_output_second")
+
+            for sku_key in key_candidates:
+                cents_per_second = cls._parse_price(pricing_skus.get(sku_key))
+                if cents_per_second is None:
+                    continue
+                matches.append(
+                    {
+                        "resolution": resolution,
+                        "sku_key": sku_key,
+                        "cost_usd": duration * cents_per_second / 100 + image_input_cost,
+                    }
+                )
+                break
+
+        if not matches:
+            return None
+
+        costs = [item["cost_usd"] for item in matches]
+        return {
+            "pricing_mode": "cents_per_video_output_second",
+            "min_cost_usd": min(costs),
+            "max_cost_usd": max(costs),
+            "resolution_estimates": matches,
+            "image_input_count": image_input_count,
+            "image_input_cost_usd": image_input_cost,
+            "assumption": (
+                "Estimate spans the published per-second prices for possible resolutions."
+                if len(matches) > 1
+                else "Estimate uses the published per-second price and attached image inputs."
+            ),
+        }
+
+    @classmethod
     def estimate_video_cost(
         cls,
         model: Dict[str, Any],
@@ -711,7 +772,9 @@ class OpenRouterCatalog:
             return None
 
         estimate = None
-        if any(key.startswith(("text_to_video_duration_seconds_", "image_to_video_duration_seconds_")) for key in pricing_skus):
+        if any(key.startswith("cents_per_video_output_second") for key in pricing_skus):
+            estimate = cls._estimate_cents_per_second_video_cost(model, pricing_skus, payload)
+        elif any(key.startswith(("text_to_video_duration_seconds_", "image_to_video_duration_seconds_")) for key in pricing_skus):
             estimate = cls._estimate_mode_resolution_priced_video_cost(model, pricing_skus, payload, mode)
         elif "video_tokens" in pricing_skus or "video_tokens_without_audio" in pricing_skus:
             estimate = cls._estimate_token_priced_video_cost(model, pricing_skus, payload)

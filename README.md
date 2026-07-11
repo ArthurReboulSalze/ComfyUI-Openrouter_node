@@ -1,6 +1,24 @@
 # ComfyUI OpenRouter Node
 
-A custom node for ComfyUI that allows you to interact with OpenRouter's API, providing access to a wide range of models.  
+A custom node for ComfyUI that allows you to interact with OpenRouter's API, providing access to a wide range of models.
+
+## How this fork differs from the original
+
+This fork is based on [gabe-init/ComfyUI-Openrouter_node](https://github.com/gabe-init/ComfyUI-Openrouter_node) and keeps its secure API-key handling, reasoning-effort control, and configurable request timeout. Compared with upstream `main` at [`45c67f9`](https://github.com/gabe-init/ComfyUI-Openrouter_node/commit/45c67f9) (checked July 11, 2026), this fork adds:
+
+| Area | This fork |
+| --- | --- |
+| Unified workflow | One backward-compatible node switches between chat, image, and video requests. Its visible controls and the ComfyUI Parameters panel adapt to the selected request type. |
+| Live model catalogs | Chat, image, and video catalogs are synchronized from OpenRouter, refreshed automatically every 15 minutes, and refreshable on demand without restarting ComfyUI. The last valid catalog remains available during a temporary API failure. |
+| Video generation | Direct asynchronous `/api/v1/videos` submission, polling, and download with text-to-video, image-to-video, start/end-frame, and reference-image modes. Model-specific durations, resolutions, aspect ratios, audio, and provider options come from published capabilities. |
+| Cost estimate | The video UI estimates cost from OpenRouter's published pricing SKUs, including duration/resolution, per-second video, audio, and connected image-input pricing where available. |
+| Credit refresh | **Refresh Credits** reads the current balance without running a generation. The node's `Credits` output is refreshed on the next workflow execution. |
+| Linked prompts | A non-empty `user_message_input` overrides the internal chat/image prompt or `video_prompt`, so one connected string can drive every request type. |
+| Workflow compatibility | Existing workflows are migrated when new controls change the serialized widget order, preventing old video settings from being assigned to unrelated inputs. The legacy node ID remains supported. |
+| Image generation | Dedicated image-model filtering, broader image-model discovery, OpenRouter `modalities` payloads, and compatibility with image-only models such as Flux. |
+| Regression coverage | Python tests cover request settings, catalogs, pricing, credits, and prompt routing; JavaScript tests cover adaptive visibility, video pricing, model-refresh parsing, and legacy workflow migration. |
+
+The original project may continue to change after the comparison point above. Features accepted upstream can therefore disappear from this list in future releases.
 
 ## Updates
 
@@ -45,8 +63,9 @@ Added a new Chat Mode feature that lets you store context to enable conversation
 - Fastest provider routing with `:nitro` modifier
 - Detailed statistics on token usage and generation speed
 - Real-time OpenRouter account balance display
+- **Refresh Credits button** - Check the current OpenRouter balance without running a generation
 - **Chat Mode** - Maintain conversation context across multiple messages with automatic session management
-- **OpenRouter Video execution node** - Ready for real async video generation with direct OpenRouter `/api/v1/videos` execution
+- **Integrated OpenRouter video mode** - Ready for real async video generation with direct OpenRouter `/api/v1/videos` execution
 - **Video controls driven by the OpenRouter catalog** - mode, duration, resolution, and aspect ratio now follow the selected video model's published capabilities
 - **Estimated video cost** - the video node includes a local cost estimate directly in the node UI, plus status/metadata details based on OpenRouter's public `pricing_skus`
 
@@ -55,7 +74,7 @@ Added a new Chat Mode feature that lets you store context to enable conversation
 1. Clone this repository into your ComfyUI custom_nodes folder:
 ```bash
 cd ComfyUI/custom_nodes
-git clone https://github.com/gabe-init/ComfyUI-Openrouter_node
+git clone https://github.com/ArthurReboulSalze/ComfyUI-Openrouter_node
 ```
 
 2. Install the required dependencies:
@@ -97,7 +116,7 @@ The model list refreshes automatically every 15 minutes. Use **Refresh Models** 
 - **image_1** through **image_10**: Multiple image inputs for multimodal models. The first image input (image_1) is always visible. Additional image inputs automatically appear as you connect images (up to 10 total).
 - **pdf_data**: PDF document input for models that support document understanding.
 - **pdf_engine**: Choose between "auto", "mistral-ocr", or "pdf-text" for PDF processing.
-- **user_message_input**: Alternative input for the user message, useful for connecting to other nodes.
+- **user_message_input**: Optional linked string prompt for every request type. When connected with non-empty text, it overrides `user_message_box` for chat/image and `video_prompt` for video.
 
 ### Outputs:
 
@@ -204,9 +223,9 @@ python manage_chats.py clean -d 30
 - For faster responses, disable "cheapest" and enable "fastest"
 - For web search capability, enable "web_search"
 
-### OpenRouter Video Node
+### OpenRouter Video Mode
 
-The repository also includes a real `OpenRouter Video` execution node.
+Set `request_type` to `video` in the unified `OpenRouter (Chat / Image / Video)` node to use the real video execution path.
 
 Safety behavior:
 

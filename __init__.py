@@ -1,6 +1,8 @@
 import os
+import asyncio
 from .openrouter_catalog import OpenRouterCatalog
 from .node import (
+    OpenRouterNode,
     NODE_CLASS_MAPPINGS,
     NODE_DISPLAY_NAME_MAPPINGS,
 )
@@ -85,6 +87,29 @@ try:
         except Exception as e:
             return web.json_response(
                 {"success": False, "error": f"Could not refresh OpenRouter models: {e}"},
+                status=502,
+            )
+
+    @PromptServer.instance.routes.get("/openrouter/credits")
+    async def openrouter_credits(request):
+        key = _read_api_key()
+        if not key:
+            return web.json_response(
+                {"success": False, "error": "OpenRouter API key is not configured."},
+                status=400,
+            )
+
+        try:
+            credits_text = await asyncio.to_thread(OpenRouterNode.fetch_credits, key, 20)
+            if credits_text.startswith("Error") or credits_text.startswith("Could not"):
+                return web.json_response(
+                    {"success": False, "error": credits_text},
+                    status=502,
+                )
+            return web.json_response({"success": True, "credits": credits_text})
+        except Exception as e:
+            return web.json_response(
+                {"success": False, "error": f"Could not refresh OpenRouter credits: {e}"},
                 status=502,
             )
 

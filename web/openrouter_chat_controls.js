@@ -7,6 +7,8 @@ const CATALOG_FORCE_DEDUP_MS = 30 * 1000;
 let catalogCache = null;
 let catalogRequest = null;
 let lastForcedCatalogRequest = 0;
+const propertiesPanelNodes = new Set();
+let propertiesPanelObserver = null;
 
 const CHAT_ONLY_WIDGETS = [
     "system_prompt",
@@ -41,8 +43,50 @@ const VIDEO_WIDGETS = [
     "provider_json",
 ];
 
-const ALL_CHAT_WIDGETS = [...CHAT_ONLY_WIDGETS, ...CHAT_SHARED_WIDGETS];
-const ALL_IMAGE_WIDGETS = [...IMAGE_ONLY_WIDGETS, ...CHAT_SHARED_WIDGETS];
+const VIDEO_MODES = new Set([
+    "text_to_video",
+    "image_to_video",
+    "start_end_frame_to_video",
+    "reference_to_video",
+]);
+
+function migrateLegacyWidgetValues(node, info) {
+    const values = info?.widgets_values;
+    const widgets = node.widgets;
+    if (!Array.isArray(values) || !Array.isArray(widgets)) {
+        return false;
+    }
+
+    const currentNames = widgets.map((widget) => widget.name);
+    const reasoningIndex = currentNames.indexOf("reasoning_effort");
+    if (reasoningIndex < 0 || !VIDEO_MODES.has(String(values[reasoningIndex] ?? ""))) {
+        return false;
+    }
+
+    const insertedDefaults = {
+        reasoning_effort: "auto",
+        request_timeout: 120,
+    };
+    const legacyNames = currentNames.filter(
+        (name) => name !== "reasoning_effort" && name !== "request_timeout",
+    );
+    const migratedValues = currentNames.map((name, currentIndex) => {
+        if (name in insertedDefaults) {
+            return insertedDefaults[name];
+        }
+        if (name.startsWith("openrouter_") || name === "estimated_cost") {
+            return widgets[currentIndex]?.value;
+        }
+        const legacyIndex = legacyNames.indexOf(name);
+        return legacyIndex >= 0 && legacyIndex < values.length
+            ? values[legacyIndex]
+            : widgets[currentIndex]?.value;
+    });
+
+    info.widgets_values = migratedValues;
+    console.info("[OpenRouter] Migrated legacy workflow widget values.");
+    return true;
+}
 
 function normalizeValues(values) {
     if (!Array.isArray(values)) {
@@ -78,7 +122,7 @@ async function requestModelCatalog(forceRefresh = false) {
         cache: "no-store",
     })
         .then(async (response) => {
-            const data = await response.json();
+            const data = await parseModelCatalogResponse(response);
             if (!response.ok || data.success === false) {
                 throw new Error(data.error || `HTTP ${response.status}`);
             }
@@ -88,10 +132,33 @@ async function requestModelCatalog(forceRefresh = false) {
             catalogCache = data;
             return data;
         })
+        .catch((error) => {
+            if (error instanceof TypeError) {
+                throw new Error("Cannot reach ComfyUI while refreshing models.");
+            }
+            throw error;
+        })
         .finally(() => {
             catalogRequest = null;
         });
     return catalogRequest;
+}
+
+async function parseModelCatalogResponse(response) {
+    const responseText = await response.text();
+    if (!responseText.trim()) {
+        throw new Error(
+            response.ok
+                ? "ComfyUI returned an empty model catalog response."
+                : `ComfyUI returned HTTP ${response.status} with an empty response.`,
+        );
+    }
+
+    try {
+        return JSON.parse(responseText);
+    } catch {
+        throw new Error(`ComfyUI returned an invalid model catalog response (HTTP ${response.status}).`);
+    }
 }
 
 function replaceObjectContents(target, source) {
@@ -151,42 +218,102 @@ function chooseValue(currentValue, values) {
     return values[0] ?? "";
 }
 
+function setWidgetHidden(widget, hidden) {
+    if (!widget) {
+        return false;
+    }
+
+    const nextHidden = Boolean(hidden);
+    const previousHidden = Boolean(widget.hidden);
+    widget.hidden = nextHidden;
+    widget.options ??= {};
+    widget.options.hidden = nextHidden;
+
+    if (widget.inputEl) {
+        widget.inputEl.style.display = nextHidden ? "none" : "";
+    }
+
+    return previousHidden !== nextHidden;
+}
+
+function applyPropertiesPanelVisibility(node) {
+    if (typeof document === "undefined" || !node?.__openrouterPropertyVisibility) {
+        return;
+    }
+
+    const nodeId = String(node.id ?? "");
+    for (const row of document.querySelectorAll(".widget-item")) {
+        if (!row.querySelector(`[node-id="${nodeId}"]`)) {
+            continue;
+        }
+        const name = row.querySelector(".editable-text")?.textContent?.trim();
+        if (!name || !(name in node.__openrouterPropertyVisibility)) {
+            continue;
+        }
+        row.style.display = node.__openrouterPropertyVisibility[name] ? "none" : "";
+    }
+}
+
+function trackPropertiesPanelVisibility(node, widgetName, hidden) {
+    node.__openrouterPropertyVisibility ??= {};
+    node.__openrouterPropertyVisibility[widgetName] = Boolean(hidden);
+    propertiesPanelNodes.add(node);
+
+    if (!propertiesPanelObserver && typeof MutationObserver !== "undefined" && typeof document !== "undefined") {
+        propertiesPanelObserver = new MutationObserver(() => {
+            for (const trackedNode of propertiesPanelNodes) {
+                applyPropertiesPanelVisibility(trackedNode);
+            }
+        });
+        propertiesPanelObserver.observe(document.body, { childList: true, subtree: true });
+    }
+}
+
+function resizeNodeToVisibleWidgets(node) {
+    requestAnimationFrame(() => {
+        const computedSize = node.computeSize?.();
+        if (computedSize && node.setSize) {
+            const currentWidth = Array.isArray(node.size) ? Number(node.size[0]) : 0;
+            node.setSize([Math.max(currentWidth || 0, computedSize[0]), computedSize[1]]);
+        }
+        node.setDirtyCanvas?.(true, true);
+        app.graph.setDirtyCanvas(true, true);
+    });
+}
+
 function syncWidgetVisibility(node, requestType) {
-    for (const name of ALL_CHAT_WIDGETS) {
-        const widget = getWidget(node, name);
-        if (widget) {
-            widget.hidden = requestType !== "chat";
-        }
-    }
-
-    for (const name of ALL_IMAGE_WIDGETS) {
-        const widget = getWidget(node, name);
-        if (widget) {
-            widget.hidden = requestType !== "image";
-        }
-    }
-
+    let changed = false;
     for (const name of CHAT_ONLY_WIDGETS) {
         const widget = getWidget(node, name);
-        if (widget) {
-            widget.hidden = requestType !== "chat";
-        }
+        const hidden = requestType !== "chat";
+        changed = setWidgetHidden(widget, hidden) || changed;
+        trackPropertiesPanelVisibility(node, name, hidden);
+    }
+
+    for (const name of IMAGE_ONLY_WIDGETS) {
+        const widget = getWidget(node, name);
+        const hidden = requestType !== "image";
+        changed = setWidgetHidden(widget, hidden) || changed;
+        trackPropertiesPanelVisibility(node, name, hidden);
+    }
+
+    for (const name of CHAT_SHARED_WIDGETS) {
+        const widget = getWidget(node, name);
+        const hidden = requestType !== "chat" && requestType !== "image";
+        changed = setWidgetHidden(widget, hidden) || changed;
+        trackPropertiesPanelVisibility(node, name, hidden);
     }
 
     for (const name of VIDEO_WIDGETS) {
         const widget = getWidget(node, name);
-        if (widget) {
-            widget.hidden = requestType !== "video";
-        }
+        const hidden = requestType !== "video";
+        changed = setWidgetHidden(widget, hidden) || changed;
+        trackPropertiesPanelVisibility(node, name, hidden);
     }
 
-    requestAnimationFrame(() => {
-        const size = node.computeSize?.();
-        if (size) {
-            node.onResize?.(size);
-        }
-        app.graph.setDirtyCanvas(true, true);
-    });
+    requestAnimationFrame(() => applyPropertiesPanelVisibility(node));
+    resizeNodeToVisibleWidgets(node);
+    return changed;
 }
 
 function syncModelList(node, requestType, chatCapabilities, imageCapabilities, videoCapabilities, allModelValues) {
@@ -340,6 +467,7 @@ function configureModelCatalog(node, globals, chatCapabilities, imageCapabilitie
             window.clearInterval(this.__openrouterCatalogTimer);
             this.__openrouterCatalogTimer = null;
         }
+        propertiesPanelNodes.delete(this);
         return onRemoved?.apply(this, arguments);
     };
 }
@@ -410,6 +538,10 @@ function configureApiKeyWidget(node) {
                         }
                         apiKeyWidget.value = "";
                         statusWidget.value = "API key: not set";
+                        const creditsStatus = getWidget(node, "openrouter_credits_status");
+                        if (creditsStatus) {
+                            creditsStatus.value = "Credits: API key not set";
+                        }
                     } else {
                         const response = await fetch("/openrouter/save_api_key", {
                             method: "POST",
@@ -459,6 +591,79 @@ function configureApiKeyWidget(node) {
         .catch(() => {});
 }
 
+async function parseCreditsResponse(response) {
+    const responseText = await response.text();
+    if (!responseText.trim()) {
+        throw new Error(
+            response.ok
+                ? "ComfyUI returned an empty credits response."
+                : `ComfyUI returned HTTP ${response.status} with an empty credits response.`,
+        );
+    }
+
+    let data;
+    try {
+        data = JSON.parse(responseText);
+    } catch {
+        throw new Error(`ComfyUI returned an invalid credits response (HTTP ${response.status}).`);
+    }
+
+    if (!response.ok || data.success === false) {
+        throw new Error(data.error || `Could not refresh credits (HTTP ${response.status}).`);
+    }
+    return data;
+}
+
+function configureCreditsWidget(node) {
+    if (node.__openrouterCreditsConfigured) {
+        return;
+    }
+    node.__openrouterCreditsConfigured = true;
+
+    let statusWidget = getWidget(node, "openrouter_credits_status");
+    if (!statusWidget) {
+        statusWidget = node.addWidget(
+            "text",
+            "openrouter_credits_status",
+            "Credits: click Refresh Credits",
+            () => {},
+            { readonly: true, serialize: false },
+        );
+        statusWidget.label = "OpenRouter credits";
+        statusWidget.serializeValue = () => undefined;
+        if (statusWidget.inputEl) {
+            statusWidget.inputEl.readOnly = true;
+        }
+    }
+
+    let buttonWidget = getWidget(node, "openrouter_refresh_credits_button");
+    if (!buttonWidget) {
+        buttonWidget = node.addWidget(
+            "button",
+            "openrouter_refresh_credits_button",
+            "Refresh Credits",
+            async () => {
+                statusWidget.value = "Credits: refreshing...";
+                app.graph.setDirtyCanvas(true, true);
+                try {
+                    const response = await fetch("/openrouter/credits", { cache: "no-store" });
+                    const data = await parseCreditsResponse(response);
+                    statusWidget.value = `${data.credits} · ${new Date().toLocaleTimeString()}`;
+                } catch (error) {
+                    statusWidget.value = error instanceof TypeError
+                        ? "Credits: cannot reach ComfyUI"
+                        : `Credits error: ${error.message}`;
+                }
+                resizeNodeToVisibleWidgets(node);
+            },
+            { serialize: false },
+        );
+        buttonWidget.serializeValue = () => undefined;
+    }
+
+    resizeNodeToVisibleWidgets(node);
+}
+
 app.registerExtension({
     name: "OpenRouter.ChatControls",
     async beforeRegisterNodeDef(nodeType, nodeData) {
@@ -479,6 +684,7 @@ app.registerExtension({
 
             syncWidgetVisibility(this, "chat");
             configureApiKeyWidget(this);
+            configureCreditsWidget(this);
             configureModelCatalog(this, globals, chatCapabilities, imageCapabilities, videoCapabilities);
 
             wrapWidgetCallback(this, "request_type", () => {
@@ -503,8 +709,10 @@ app.registerExtension({
 
         const onConfigure = nodeType.prototype.onConfigure;
         nodeType.prototype.onConfigure = function () {
+            migrateLegacyWidgetValues(this, arguments[0]);
             onConfigure?.apply(this, arguments);
             configureApiKeyWidget(this);
+            configureCreditsWidget(this);
             configureModelCatalog(this, globals, chatCapabilities, imageCapabilities, videoCapabilities);
             requestAnimationFrame(() => {
                 const requestType = String(getWidget(this, "request_type")?.value ?? "chat");
